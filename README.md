@@ -100,7 +100,7 @@ ABM-SharedEconomy-Trust/
 
 ## Authors
 
-- **Danning Yu** — Platform mechanism design, simulation, empirical analysis
+- **Danning Yu** , **Xinai Li** (co-first author)
 - Shanghai International Studies University, School of International Finance and Trade
 
 ---
