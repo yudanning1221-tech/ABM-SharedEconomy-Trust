@@ -1,0 +1,1526 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="false">
+  <code><![CDATA[;;; =================================================================
+;;; V2.4 — 补全平台自适应治理 + 两类外部冲击
+;;;
+;;; V2.3 → V2.4 变更清单（A同学）：
+;;;   ① 补全 step1 平台自适应治理：avg-trust < T-low → 紧缩，> T-high → 宽松
+;;;   ② 新增全局 shock1-active? shock2-active? shock2-end-tick
+;;;   ③ 新增 apply-shocks 过程，在每轮 step1 前调用
+;;;   ④ update-consumer-participation 加入冲击1（订单骤降30%）效果
+;;;   ⑤ roulette-select-worker 加入冲击2（算法调整）派单变化
+;;;   ⑥ step8 新增颜色反馈：冲击期间视图边框变色
+;;;   界面新增：shock1-tick / shock2-tick / shock1-duration / shock1-magnitude
+;;;             4个Monitor + 1个参数演化Plot
+;;;
+;;; 界面滑块（3个，与V2.2一致）：
+;;;   num-workers          默认100  [10, 300]
+;;;   num-consumers        默认50   [10, 200]
+;;;   good-score-threshold 默认0.6  [0.3, 1.0] 步长0.05
+;;; =================================================================
+
+breed [workers  worker]
+breed [consumers consumer]
+
+globals [
+  alpha-e  alpha-c  rep-threshold  transparency
+  T-low  T-high  adj-step
+  avg-trust
+  gamma-1  gamma-2  gamma-3
+  kappa  delta-plus  delta-minus
+  beta-fermi  alpha-c-critical
+  effort-cost-rate  rent-seek-rate
+  dispatch-power       ;; ★ V2.3 新增
+
+;; ★ V2.4 外部冲击状态（A同学管理）
+  shock1-active?       ;; 冲击1（订单骤降）是否激活
+  shock2-active?       ;; 冲击2（算法突变）是否激活
+  shock2-end-tick      ;; 冲击2自动结束的tick
+  pre-shock2-transparency  ;; 冲击2前保存的透明度，用于恢复
+
+]
+
+workers-own [
+  trust-level  rep-a  rep-g  rep-score  prev-rep-score
+  strategy  e-p  e-r  focus-type  rationality
+  is-youth?  platform-dep  income-threshold
+  active?  warning-count  last-income  smoothed-income
+]
+
+consumers-own [
+  trust-type  motivation  strictness  participation-prob
+  trust-tendency  wom-willingness
+]
+
+;; =================================================================
+;; SETUP
+;; =================================================================
+to setup
+  clear-all
+
+  set gamma-1          0.2
+  set gamma-2          0.3
+  set gamma-3          0.5
+  set kappa            1.2
+  set delta-plus       0.02     ;; ★ V2.3（原 0.05）
+  set delta-minus      0.02     ;; ★ V2.3（原 0.05）
+  set beta-fermi       0.5
+  set alpha-c-critical 0.7
+  set effort-cost-rate 0.5
+  set rent-seek-rate   0.55
+  set dispatch-power   0.5      ;; ★ V2.3 新增
+
+  set alpha-e       0.7
+  set alpha-c       0.4
+  set rep-threshold 0.6
+  set transparency  0.5
+  set T-low         0.4
+  set T-high        0.7
+  set adj-step      0.05
+
+  create-workers num-workers [
+    set is-youth? (random-float 1 < 0.8)
+    set shape "person"
+    setxy random-xcor random-ycor
+
+    ifelse is-youth?
+      [ set trust-level rnd-truncated-normal 0.75 0.18 0 1 ]
+      [ set trust-level rnd-truncated-normal 0.72 0.18 0 1 ]
+
+    set rep-a          rnd-beta 5 3
+    set rep-g          rnd-beta 5 3
+    set rep-score      (0.6 * rep-a + 0.4 * rep-g)
+    set prev-rep-score rep-score
+
+    ifelse is-youth?
+      [ set strategy ifelse-value (random-float 1 < 0.55) ["trustworthy"] ["untrustworthy"] ]
+      [ set strategy ifelse-value (random-float 1 < 0.30) ["trustworthy"] ["untrustworthy"] ]
+
+    ifelse is-youth?
+      [ set focus-type ifelse-value (random-float 1 < 0.6) ["promotion"] ["prevention"] ]
+      [ set focus-type ifelse-value (random-float 1 < 0.5) ["promotion"] ["prevention"] ]
+
+    ifelse is-youth?
+      [ set rationality 0.25 + random-float 0.45 ]
+      [ set rationality 0.35 + random-float 0.45 ]
+
+    ifelse is-youth?
+      [ set platform-dep 0.55 + random-float 0.35 ]
+      [ set platform-dep 0.40 + random-float 0.35 ]
+
+    set income-threshold max list 0 (random-normal 0.3 0.1)
+    set active?          true
+    set warning-count    0
+    set last-income      0
+    set smoothed-income  income-threshold
+    set e-p              0.5
+    set e-r              0.5
+    set color ifelse-value (strategy = "trustworthy") [blue] [orange]
+  ]
+
+  create-consumers num-consumers [
+    set shape "circle"
+    set color red
+    setxy random-xcor random-ycor
+    set trust-type         ifelse-value (random-float 1 < 0.5) ["trusting"] ["untrusting"]
+    set motivation         ifelse-value (random-float 1 < 0.5) ["monetary"] ["non-monetary"]
+    set strictness         rnd-beta 2 3
+    set participation-prob 0.3 + random-float 0.4
+    set trust-tendency     ifelse-value (trust-type = "trusting") [0.7] [0.3]
+    set wom-willingness    ifelse-value (trust-type = "trusting") [0.7] [0.3]
+  ]
+
+  set avg-trust mean [trust-level] of workers with [active?]
+
+;; ★ V2.4 冲击状态初始化
+  set shock1-active?          false
+  set shock2-active?          false
+  set shock2-end-tick         -1
+  set pre-shock2-transparency transparency
+
+  reset-ticks
+end
+
+;; =================================================================
+;; GO
+;; =================================================================
+to go
+  if ticks >= 500 [ stop ]
+  apply-shocks            ;; ★ V2.4：冲击触发与恢复
+  step1-platform-update
+  step2-update-effort
+  update-consumer-participation
+  step3-do-transaction
+  step4-update-trust
+  step5-fermi-imitation
+  step6-platform-enforce
+  step7-word-of-mouth
+  step8-record
+  tick
+end
+
+;; =================================================================
+;; STEP 1（A同学，保持不动）
+;; =================================================================
+to step1-platform-update
+  let active-w workers with [active?]
+  if count active-w > 0 [ set avg-trust mean [trust-level] of active-w ]
+  if (ticks mod 10 = 0) and (ticks > 0) [
+    ;; ★ V2.4 平台自适应治理：每10步根据 avg-trust 调整 alpha-e / alpha-c
+    ;; 规则来自概念模型ODD §平台自适应治理子模型
+    ifelse avg-trust < T-low [
+      ;; 信任过低 → 紧缩：加强管控，削减激励
+      set alpha-c clip-01 (alpha-c + adj-step)
+      set alpha-e clip-01 (alpha-e - adj-step)
+    ] [
+      if avg-trust > T-high [
+        ;; 信任充足 → 宽松：加强激励，削减管控
+        set alpha-e clip-01 (alpha-e + adj-step)
+        set alpha-c clip-01 (alpha-c - adj-step)
+      ]
+      ;; T-low ≤ avg-trust ≤ T-high：维持不变
+    ]
+  ]
+end
+
+;; =================================================================
+;; STEP 2 — 劳动者努力分配（B同学，与V2.2一致）
+;; =================================================================
+to step2-update-effort
+  ask workers with [active?] [
+    let epsilon random-normal 0 0.05
+    let base-ep  0.3
+               + alpha-e * trust-level
+               + (1 - rationality) * (rep-score - rep-threshold)
+               + epsilon
+    let strategy-mod ifelse-value (strategy = "trustworthy") [0.15] [-0.15]
+    set base-ep base-ep + strategy-mod
+    if focus-type = "promotion"  [ set base-ep base-ep + 0.05 ]
+    if focus-type = "prevention" [ set base-ep base-ep - 0.03 ]
+    if alpha-c > alpha-c-critical [
+      let penalty -0.8 * (alpha-c - alpha-c-critical) * platform-dep
+      if is-youth? [ set penalty penalty * 1.4 ]
+      set base-ep base-ep + penalty
+    ]
+    set e-p clip-01 base-ep
+    ;; 不可信者维持最低服务质量
+    if strategy = "untrustworthy" [
+      set e-p max list e-p 0.25
+    ]
+    ;; e-r 统一在最后更新，对所有劳动者都适用
+    set e-r 1 - e-p
+  ]
+end
+
+;; =================================================================
+;; 消费者参与概率（B同学，与V2.2一致）
+;; =================================================================
+to update-consumer-participation
+  let avg-rep ifelse-value (any? workers with [active?])
+    [ mean [rep-score] of workers with [active?] ] [ 0.5 ]
+  ask consumers [
+    ifelse trust-type = "trusting"
+      [ set participation-prob clip-01 (0.8 + 0.2 * avg-trust) ]
+      [ set participation-prob clip-01 (0.2 + 0.8 * max list 0 (avg-trust - 0.5)) ]
+    if motivation = "non-monetary" [
+      set participation-prob clip-01 (participation-prob + 0.1 * (avg-rep - 0.5))
+    ]
+    ;; ★ V2.4 冲击1（订单骤降）：按 shock1-magnitude 比例压低参与概率
+    if shock1-active? [
+      set participation-prob clip-01 (participation-prob * (1 - shock1-magnitude))
+    ]
+  ]
+end
+
+;; =================================================================
+;; STEP 3 — 交易（与V2.2一致，仅smoothed系数微调）
+;; =================================================================
+to step3-do-transaction
+  ask workers with [active?] [
+    set prev-rep-score rep-score
+    set last-income    0
+  ]
+  ask consumers [
+    if random-float 1 < participation-prob [
+      let chosen roulette-select-worker
+      if chosen != nobody [
+        let ec strictness
+        ask chosen [
+          let q-val generate-quality e-p ec
+          let score generate-score q-val ec
+          set last-income last-income + score * (1 - 0.2) - effort-cost-rate * (e-p ^ 2)
+          update-reputation score
+        ]
+      ]
+    ]
+  ]
+  ask workers with [active?] [
+    set last-income     last-income + e-r * rent-seek-rate * (1 - transparency)
+    set smoothed-income 0.8 * smoothed-income + 0.2 * last-income   ;; ★ V2.3（原0.7/0.3）
+  ]
+end
+
+;; =================================================================
+;; ★ V2.3 核心修改：亚线性派单权重
+;;
+;; 原来：weight = rep-score（线性）
+;; 现在：weight = rep-score ^ dispatch-power（dispatch-power=0.5 即 sqrt）
+;;
+;; rep=0.9 vs 0.2 权重比：线性 4.5:1 → sqrt 2.1:1
+;; =================================================================
+to-report roulette-select-worker
+  let candidates workers with [active?]
+  if count candidates = 0 [ report nobody ]
+  let cand-list  sort-on [who] candidates
+  ;; ★ V2.3：亚线性权重
+  ;; ★ V2.4 冲击2（算法调整）：重构派单规则
+  ;;   - 促进型调节焦点 & 高声誉劳动者获权重加成
+  ;;   - 低声誉劳动者（rep < 0.4）权重降低70%
+let weights ifelse-value shock2-active? [
+    map [ w ->
+      (([rep-score] of w) ^ dispatch-power) 
+      * (ifelse-value ([focus-type] of w = "promotion") [1.5] [1.0]) 
+      * (ifelse-value ([rep-score] of w < 0.4) [0.3] [1.0])
+    ] cand-list
+  ] [
+    map [ w -> ([rep-score] of w) ^ dispatch-power ] cand-list
+  ]
+  
+  let total-w    sum weights
+  if total-w <= 0 [ report one-of candidates ]
+  let r   random-float total-w
+  let cum 0
+  let i   0
+  while [i < length cand-list] [
+    set cum cum + (item i weights)
+    if cum >= r [ report (item i cand-list) ]
+    set i i + 1
+  ]
+  report last cand-list
+end
+
+;; 感知质量 & 评分（不变）
+to-report generate-quality [ep ec]
+  let xi random-normal 0 (0.1 * (1 - ec))
+  report clip-01 (ep + xi)
+end
+
+to-report generate-score [q-val ec]
+  let noise random-normal 0 (0.1 * (1 - ec))
+  report clip-01 (q-val + noise)
+end
+
+;; =================================================================
+;; 声誉更新（结构不变，δ值已在setup中缩小）
+;; ★ V2.3 效果：δ+=0.02 → 每笔好评 rep 仅增 0.02×(1-rep)
+;;             δ-=0.02 → 每笔差评 rep 降 κλ×0.02×rep = 0.075×rep
+;; =================================================================
+to update-reputation [score]
+  let lambda-amp (1 + (1 - transparency))
+  ifelse score >= good-score-threshold [
+    set rep-score clip-01 (rep-score + delta-plus * (1 - rep-score))
+  ] [
+    let penalty kappa * lambda-amp * delta-minus * rep-score
+    set rep-score clip-01 (rep-score - min list penalty (0.30 * rep-score))
+  ]
+  ;; 不可信者有一个rep下限，模拟最低服务质量维持
+  if strategy = "untrustworthy" [
+    set rep-score max list rep-score 0.20
+  ]
+  set rep-a clip-01 (0.7  * rep-a + 0.3  * rep-score)
+  set rep-g clip-01 (0.85 * rep-g + 0.15 * rep-score)
+end
+
+;; =================================================================
+;; STEP 4（不变）
+;; =================================================================
+to step4-update-trust
+  ask workers with [active?] [
+    let delta-r (rep-score - prev-rep-score)
+    let new-t   trust-level
+                + gamma-1 * alpha-e * (1 - trust-level)
+                - gamma-2 * alpha-c * trust-level
+                + gamma-3 * delta-r
+    set trust-level clip-01 new-t
+  ]
+end
+
+;; =================================================================
+;; STEP 5 — Fermi 模仿（与V2.2一致）
+;; =================================================================
+to step5-fermi-imitation
+  if ticks < 20 [ stop ]
+  if count workers with [active?] < 10 [ stop ]
+  ask workers with [active?] [
+    if random-float 1 < 0.02 [
+      set strategy ifelse-value (strategy = "trustworthy")
+        ["untrustworthy"] ["trustworthy"]
+      stop
+    ]
+    if random-float 1 > 0.10 [ stop ]
+    let my-income smoothed-income
+    let num-to-sample 3 + random 3
+    let candidates other workers with [active?]
+    if not any? candidates [ stop ]
+    let sample-size min list num-to-sample (count candidates)
+    let peers n-of sample-size candidates
+    let best-peer max-one-of peers [smoothed-income]
+    if best-peer = nobody [ stop ]
+    let peer-income [smoothed-income] of best-peer
+    if peer-income > my-income [
+      let p-imitate 1 / (1 + exp (0 - beta-fermi * (peer-income - my-income)))
+      if is-youth? [ set p-imitate min list 1.0 (p-imitate * 1.2) ]
+      if random-float 1 < p-imitate [
+        set strategy [strategy] of best-peer
+      ]
+    ]
+  ]
+end
+
+;; =================================================================
+;; APPLY-SHOCKS — 冲击触发与自动恢复（A同学，V2.4新增）
+;; 调用时机：每轮 go 的最开头，早于所有 step
+;;
+;; 冲击1（订单骤降）：在 shock1-tick 激活，持续 shock1-duration 步后自动关闭
+;;   效果：update-consumer-participation 内按 shock1-magnitude 削减参与概率
+;;
+;; 冲击2（算法调整）：在 shock2-tick 激活，固定持续10步后自动恢复
+;;   效果：透明度 τ 骤降至0.1，派单规则重构（见 roulette-select-worker）
+;; =================================================================
+to apply-shocks
+
+  ;; ── 冲击1：触发 ──
+  if ticks = shock1-tick [
+    set shock1-active? true
+  ]
+  ;; 冲击1：自动结束
+  if shock1-active? and ticks >= (shock1-tick + shock1-duration) [
+    set shock1-active? false
+  ]
+
+  ;; ── 冲击2：触发 ──
+  if ticks = shock2-tick [
+    set shock2-active?          true
+    set shock2-end-tick         ticks + 10
+    set pre-shock2-transparency transparency
+    set transparency            0.1   ;; τ 骤降：信息不对称程度骤增
+  ]
+  ;; 冲击2：自动恢复
+  if shock2-active? and ticks >= shock2-end-tick [
+    set shock2-active? false
+    set transparency   pre-shock2-transparency  ;; τ 恢复
+  ]
+
+end
+
+;; =================================================================
+;; STEP 6  ★ V2.3 简化：仅极低声誉出局，warmup 50 tick
+;;
+;; 原因：δ=0.02 下声誉变化慢，0.4 阈值会在 tick 33 就开始
+;;       误杀尚未建立声誉的不可信劳动者，消灭策略多样性
+;;
+;; 新规则：rep < 0.15 的劳动者直接移出（真正的极端搭便车者）
+;;         不可信劳动者从 0.38 降到 0.15 需 ~90 tick → 足够参与博弈
+;; =================================================================
+to step6-platform-enforce
+  if ticks < 50 [ stop ]
+  ask workers with [active?] [
+    ifelse rep-score < 0.08 [
+      set warning-count warning-count + 1
+    ] [
+      if warning-count > 0 [ set warning-count warning-count - 1 ]
+    ]
+    if warning-count >= 10 [
+      set active? false
+    ]
+  ]
+end
+
+;; =================================================================
+;; STEP 7 — 口碑传播（不变）
+;; =================================================================
+to step7-word-of-mouth
+  ask consumers [
+    let nearby other consumers in-radius 5
+    if any? nearby [
+      let target one-of nearby
+      ifelse trust-type = "trusting" [
+        if random-float 1 < wom-willingness [
+          ask target [
+            set trust-tendency clip-01 (trust-tendency + 0.1)
+            sync-trust-type-from-tendency
+          ]
+        ]
+      ] [
+        if random-float 1 < wom-willingness [
+          ask target [
+            set trust-tendency clip-01 (trust-tendency - 0.1)
+            sync-trust-type-from-tendency
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+to sync-trust-type-from-tendency
+  set trust-type      ifelse-value (trust-tendency > 0.5) ["trusting"] ["untrusting"]
+  set wom-willingness ifelse-value (trust-type = "trusting") [0.7] [0.3]
+end
+
+;; =================================================================
+;; STEP 8（不变）
+;; =================================================================
+to step8-record
+  ask workers [
+    ifelse active? [
+      set color ifelse-value (strategy = "trustworthy") [blue] [orange]
+      set size 0.3 + trust-level
+    ] [
+      set color gray
+      set size 0.3
+    ]
+  ]
+end
+
+;; =================================================================
+;; 报告器
+;; =================================================================
+to-report get-proportion-trustworthy
+  let active-w workers with [active?]
+  if count active-w = 0 [ report 0 ]
+  report count active-w with [strategy = "trustworthy"] / count active-w
+end
+
+to-report get-avg-reputation
+  let active-w workers with [active?]
+  if count active-w = 0 [ report 0 ]
+  report mean [rep-score] of active-w
+end
+
+to-report get-avg-ep
+  let active-w workers with [active?]
+  if count active-w = 0 [ report 0 ]
+  report mean [e-p] of active-w
+end
+
+to-report get-avg-income-trustworthy
+  let tw workers with [active? and strategy = "trustworthy"]
+  if count tw = 0 [ report 0 ]
+  report mean [smoothed-income] of tw
+end
+
+to-report get-avg-income-untrustworthy
+  let uw workers with [active? and strategy = "untrustworthy"]
+  if count uw = 0 [ report 0 ]
+  report mean [smoothed-income] of uw
+end
+
+;; ★ V2.3 新增：活跃劳动者数量
+to-report get-active-count
+  report count workers with [active?]
+end
+
+;; ★ V2.4 新增：平台参数与冲击状态报告器
+to-report get-alpha-e
+  report alpha-e
+end
+
+to-report get-alpha-c
+  report alpha-c
+end
+
+to-report shock-status-text
+  if shock1-active? and shock2-active? [ report "冲击1+2 同时" ]
+  if shock1-active?  [ report "冲击1 激活（订单骤降）" ]
+  if shock2-active?  [ report "冲击2 激活（算法突变）" ]
+  report "无冲击"
+end
+
+to-report get-transparency
+  report transparency
+end
+
+;; =================================================================
+;; 辅助函数（不变）
+;; =================================================================
+to-report clip-01 [x]
+  report min list 1.0 (max list 0.0 x)
+end
+
+to-report rnd-truncated-normal [mu sigma lo hi]
+  let v random-normal mu sigma
+  while [v < lo or v > hi] [ set v random-normal mu sigma ]
+  report v
+end
+
+to-report rnd-beta [a b]
+  let x 0
+  let y 0
+  let s 2
+  while [s > 1] [
+    set x (random-float 1) ^ (1 / a)
+    set y (random-float 1) ^ (1 / b)
+    set s x + y
+  ]
+  report x / s
+end
+]]></code>
+  <widgets>
+    <view x="233" wrappingAllowedX="true" y="10" frameRate="30.0" minPycor="-16" height="433" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="true" width="433" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <monitor x="20" precision="17" y="190" height="60" fontSize="11" display="平均信任度" width="100" sizeVersion="0">avg-trust</monitor>
+    <monitor x="676" precision="3" y="15" height="60" fontSize="11" width="100" display="可信劳动者占比">get-proportion-trustworthy</monitor>
+    <monitor x="676" precision="3" y="84" height="60" fontSize="11" width="100" display="平均声誉">get-avg-reputation</monitor>
+    <monitor x="676" precision="3" y="153" height="60" fontSize="11" width="100" display="平均生成努力">get-avg-ep</monitor>
+    <plot x="678" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="T_avg" y="225" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="时间步" display="信任水平演化">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="avg-trust" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot avg-trust</update>
+      </pen>
+    </plot>
+    <plot x="794" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="占比" y="27" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="时间步" display="策略分布演化">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="可信" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot get-proportion-trustworthy</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="不可信" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot 1 - get-proportion-trustworthy</update>
+      </pen>
+    </plot>
+    <plot x="927" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="水平" y="228" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="时间步" display="声誉与努力">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="平均声誉" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot get-avg-reputation</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="平均生产努力" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plot get-avg-ep</update>
+      </pen>
+    </plot>
+    <monitor x="1041" precision="4" y="16" height="60" fontSize="11" width="100" display="可信策略平均收入">get-avg-income-trustworthy</monitor>
+    <monitor x="1043" precision="4" y="83" height="60" fontSize="11" width="100" display="不可信策略平均收入">get-avg-income-untrustworthy</monitor>
+    <monitor x="1045" precision="4" y="156" height="60" fontSize="11" width="100" display="活跃劳动者数">get-active-count</monitor>
+    <slider x="18" step="1" y="476" max="490" width="250" display="shock1-tick" height="50" min="50" direction="Horizontal" default="150.0" variable="shock1-tick"></slider>
+    <slider x="18" step="1" y="541" max="490" width="250" display="shock2-tick" height="50" min="50" direction="Horizontal" default="250.0" variable="shock2-tick"></slider>
+    <slider x="301" step="1" y="478" max="60" width="250" display="shock1-duration" height="50" min="1" direction="Horizontal" default="20.0" variable="shock1-duration"></slider>
+    <slider x="304" step="0.01" y="543" max="0.6" width="250" display="shock1-magnitude" height="50" min="0.05" direction="Horizontal" default="0.3" variable="shock1-magnitude"></slider>
+    <plot x="1068" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="强度/比例" y="428" xMin="0.0" height="175" legend="false" xMax="100.0" yMin="0.0" width="230" xAxis="时间（ticks)" display="治理参数演化">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="激励强度" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot alpha-e</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="管控强度" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot alpha-c</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="平均信任" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plot avg-trust</update>
+      </pen>
+    </plot>
+    <button x="35" y="371" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="66" sizeVersion="0">setup
+</button>
+    <button x="123" y="371" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="63" sizeVersion="0">go</button>
+    <slider x="6" step="0.05" y="275" max="1" width="215" display="good-score-threshold" height="50" min="0.3" direction="Horizontal" default="0.6" variable="good-score-threshold"></slider>
+    <slider x="8" step="1" y="104" max="200" display="num-consumers" height="50" min="10" direction="Horizontal" default="77.0" variable="num-consumers" width="210" sizeVersion="0"></slider>
+    <slider x="8" step="1" y="36" max="300" display="num-workers" height="50" min="10" direction="Horizontal" default="175.0" variable="num-workers" width="207" sizeVersion="0"></slider>
+    <monitor x="802" precision="17" y="430" height="60" fontSize="11" width="100" display="激励强度 (αe)">alpha-e</monitor>
+    <monitor x="686" precision="17" y="432" height="60" fontSize="11" width="100" display="当前冲击状态">shock-status-text</monitor>
+    <monitor x="687" precision="17" y="499" height="60" fontSize="11" width="100" display="平均信任度">avg-trust</monitor>
+    <monitor x="802" precision="17" y="497" height="60" fontSize="11" width="100" display="管控强度 (αc)">alpha-c</monitor>
+    <monitor x="918" precision="17" y="497" height="60" fontSize="11" width="100" display="平台透明度">transparency</monitor>
+    <monitor x="918" precision="17" y="429" height="60" fontSize="11" width="100" display="存活劳动者数">count workers with [active?]</monitor>
+    <plot x="1160" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="滑动平均收入" y="27" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" xAxis="时间步" display="策略收益对比">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="可信收入" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot get-avg-income-trustworthy</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="不可信收入" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot get-avg-income-untrustworthy</update>
+      </pen>
+    </plot>
+    <monitor x="1170" precision="17" y="228" height="60" fontSize="11" width="100" display="最低声誉（活跃）">min [rep-score] of workers with [active?]</monitor>
+    <monitor x="1172" precision="17" y="298" height="60" fontSize="11" width="100" display="warning-count 均值">mean [warning-count] of workers with [active?]</monitor>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>

@@ -1,0 +1,7 @@
+"BehaviorSpace results (NetLogo 7.0.3)","Stats version 2.0"
+"1.nlogox"
+"exp3_reputation"
+"04/16/2026 13:26:45:774 +0800"
+"min-pxcor","max-pxcor","min-pycor","max-pycor"
+"-16","16","-16","16"
+"reputation-mechanism?","[step]","(mean) avg-trust","(std) avg-trust","(mean) get-proportion-trustworthy","(std) get-proportion-trustworthy","(mean) get-avg-reputation","(std) get-avg-reputation","(mean) get-avg-ep","(std) get-avg-ep","(mean) get-avg-income-trustworthy","(std) get-avg-income-trustworthy","(mean) get-avg-income-untrustworthy","(std) get-avg-income-untrustworthy","(mean) get-active-count","(std) get-active-count","(mean) alpha-e","(std) alpha-e","(mean) alpha-c","(std) alpha-c"
